@@ -30,7 +30,7 @@ setuptools.setup(
     install_requires=[
         'tqdm',
         'torch>=2.4',
-        'transformers>=4.49,<5.13',
+        'transformers>=5.12,<5.13',
         'accelerate>=1.0',
         'safetensors',
         'huggingface-hub',

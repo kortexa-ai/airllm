@@ -128,11 +128,17 @@ class AirLLMBaseModel:
 
         self.set_layer_names_dict()
 
+        # Most checkpoints use the same names as the runtime model. A few native releases use a
+        # different on-disk namespace, though; keep the runtime names for module traversal and hand
+        # the checkpoint names to the splitter. Subclasses can provide an ``aliases`` mapping for
+        # shard lookup without teaching the generic loader model-specific renames.
+        self.checkpoint_layer_names_dict = self.layer_names_dict.get('checkpoint', self.layer_names_dict)
+
         self.model_local_path, self.checkpoint_path = find_or_create_local_splitted_path(
             model_local_path_or_repo_id,
             layer_shards_saving_path,
             compression=compression,
-            layer_names=self.layer_names_dict,
+            layer_names=self.checkpoint_layer_names_dict,
             hf_token=hf_token,
             delete_original=delete_original)
 
@@ -333,9 +339,22 @@ class AirLLMBaseModel:
 
     # ---- weight streaming -------------------------------------------------------------------
 
+    def _checkpoint_layer_name(self, runtime_layer_name):
+        """Return the shard name corresponding to a runtime module name."""
+        aliases = self.checkpoint_layer_names_dict.get('aliases', {})
+        if runtime_layer_name in aliases:
+            return aliases[runtime_layer_name]
+
+        runtime_prefix = self.layer_names_dict['layer_prefix']
+        checkpoint_prefix = self.checkpoint_layer_names_dict['layer_prefix']
+        if runtime_layer_name.startswith(runtime_prefix + '.'):
+            return checkpoint_prefix + runtime_layer_name[len(runtime_prefix):]
+        return runtime_layer_name
+
     def load_layer_to_cpu(self, layer_name):
         t = time.time()
-        load_layer_output = load_layer(self.checkpoint_path, layer_name, self.profiling_mode)
+        checkpoint_layer_name = self._checkpoint_layer_name(layer_name)
+        load_layer_output = load_layer(self.checkpoint_path, checkpoint_layer_name, self.profiling_mode)
         elapsed_time = time.time() - t
 
         if self.profiling_mode:
@@ -645,7 +664,7 @@ class AirLLMBaseModel:
             if not layer_name.startswith(layer_prefix + '.'):
                 continue
             try:
-                names = layer_tensor_names(self.checkpoint_path, layer_name)
+                names = layer_tensor_names(self.checkpoint_path, self._checkpoint_layer_name(layer_name))
             except Exception:
                 continue
 
@@ -696,7 +715,8 @@ class AirLLMBaseModel:
     def _expert_pre_hook(self, module, args):
         layer_idx, expert_idx = module._airllm_expert
         keys = self._expert_keys[layer_idx][expert_idx]
-        state_dict = load_layer_subset(self.checkpoint_path, self.layer_names[layer_idx], keys)
+        state_dict = load_layer_subset(
+            self.checkpoint_path, self._checkpoint_layer_name(self.layer_names[layer_idx]), keys)
         module._airllm_moved = self.move_layer_to_device(state_dict)
 
     def _expert_post_hook(self, module, args, output):
@@ -714,7 +734,8 @@ class AirLLMBaseModel:
         keys = self._non_expert_keys.get(idx) if getattr(self, '_expert_streaming', False) else None
         if keys is None:
             return self.load_layer_to_cpu(self.layer_names[idx])
-        return load_layer_subset(self.checkpoint_path, self.layer_names[idx], keys)
+        return load_layer_subset(
+            self.checkpoint_path, self._checkpoint_layer_name(self.layer_names[idx]), keys)
 
     def _pre_hook(self, module, args):
         idx = module._airllm_idx
