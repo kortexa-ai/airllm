@@ -25,8 +25,12 @@ routed experts selected by each V4 MoE layer.
 2. **Local execution test — passed:** a tiny native-format V4 model produces
    exactly the same logits as Transformers while loading only the experts selected
    by its router.
-3. **One-layer smarty canary:** native MXFP4 expert tensors can be read,
-   transferred, and executed on SM120 with bounded memory.
+3. **One-layer smarty canary — passed:** native packed FP4 expert tensors were read,
+   transferred, and executed on SM120. A one-token layer-0 forward routed to exactly six
+   experts and produced finite BF16 logits with 1,054 MiB peak allocation / 1,066 MiB peak
+   reservation. The first forward took 65.5 seconds including Triton kernel fetch/compile;
+   DeepGEMM currently declines SM120. Reproduce with
+   `air_llm/examples/deepseek_v4_one_layer.py` after installing the `deepseek-v4` extra.
 4. **Full-model canary:** one short prompt produces coherent output with a
    bounded context and token count.
 

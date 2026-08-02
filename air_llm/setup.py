@@ -40,6 +40,11 @@ setuptools.setup(
         # 'compressed-tensors' is optional too: only checkpoints stored in that format (Kimi K3's
         # MXFP4 weights) need it, and transformers raises a clear error naming it when it is missing.
     ],
+    extras_require={
+        # Transformers loads its FP4/FP8 CUDA kernels through this package. Keep the range aligned
+        # with the Transformers 5.12 integration; newer kernels releases use an incompatible API.
+        'deepseek-v4': ['kernels>=0.12,<0.13'],
+    },
     classifiers=[
         "Programming Language :: Python :: 3",
         "License :: OSI Approved :: Apache Software License",
