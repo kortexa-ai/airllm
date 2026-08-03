@@ -30,7 +30,7 @@ class AirLLMDeepseekV4(AirLLMBaseModel):
     # avoids 43 full GC / CUDA cache purges per generated token without retaining live weights.
     clean_memory_after_layer = False
 
-    def __init__(self, *args, expert_cache_size=0, **kwargs):
+    def __init__(self, *args, expert_cache_size=0, resident_non_expert_weights=False, **kwargs):
         """Create a V4 adapter, optionally retaining routed experts per layer on the device.
 
         ``expert_cache_size`` is the maximum number of experts retained for each MoE layer. A
@@ -39,8 +39,12 @@ class AirLLMDeepseekV4(AirLLMBaseModel):
         if expert_cache_size < 0:
             raise ValueError('expert_cache_size must be non-negative')
         self.expert_cache_size = expert_cache_size
+        self.resident_non_expert_weights = resident_non_expert_weights
         self._expert_cache = {}
         super().__init__(*args, **kwargs)
+
+    def _keep_streamed_layer_resident(self, idx):
+        return self.resident_non_expert_weights
 
     def set_layer_names_dict(self):
         self.layer_names_dict = {

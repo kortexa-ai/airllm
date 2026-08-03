@@ -34,6 +34,7 @@ def main():
     parser.add_argument("--expect-prefix", default="Paris")
     parser.add_argument("--prefetching", action="store_true")
     parser.add_argument("--expert-cache-size", type=int, default=0)
+    parser.add_argument("--resident-non-expert-weights", action="store_true")
     parser.add_argument("--profile", action="store_true")
     args = parser.parse_args()
 
@@ -57,6 +58,7 @@ def main():
         max_seq_len=64,
         prefetching=args.prefetching,
         expert_cache_size=args.expert_cache_size,
+        resident_non_expert_weights=args.resident_non_expert_weights,
     )
     prompt = encode_messages([{"role": "user", "content": args.prompt}], thinking_mode="chat")
     prompt_ids = model.tokenizer.encode(prompt, return_tensors="pt").to(device)
@@ -220,6 +222,7 @@ def main():
         "max_new_tokens": args.max_new_tokens,
         "prefetching": args.prefetching,
         "expert_cache_size": args.expert_cache_size,
+        "resident_non_expert_weights": args.resident_non_expert_weights,
         "profile": args.profile,
         "free_before_gib": round(free_before / 2**30, 3),
         "allocator_cap_gib": round(total * ALLOCATOR_FRACTION / 2**30, 3),

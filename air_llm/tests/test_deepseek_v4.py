@@ -129,6 +129,7 @@ def test_tiny_native_checkpoint_matches_transformers_and_batches_routed_expert_r
             dtype=torch.float32,
             prefetching=False,
             expert_cache_size=config.num_experts_per_tok,
+            resident_non_expert_weights=True,
         )
         expert_reads = []
         original_load_subset = deepseek_v4_module.load_layer_subset

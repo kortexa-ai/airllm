@@ -631,11 +631,27 @@ class AirLLMBaseModel:
 
         self._setup_expert_streaming()
 
+        resident_indices = [
+            idx for idx in self._streamed_indices if self._keep_streamed_layer_resident(idx)
+        ]
+        for idx in resident_indices:
+            self.move_layer_to_device(self._load_streamed_layer(idx))
+        if resident_indices:
+            resident_set = set(resident_indices)
+            self._streamed_indices = [
+                idx for idx in self._streamed_indices if idx not in resident_set
+            ]
+            self._streamed_set = set(self._streamed_indices)
+
         for idx in self._streamed_indices:
             module = self.layers[idx]
             module._airllm_idx = idx
             module.register_forward_pre_hook(self._pre_hook)
             module.register_forward_hook(self._post_hook)
+
+    def _keep_streamed_layer_resident(self, idx):
+        """Return whether a normally streamed module should instead remain on the device."""
+        return False
 
     # ---- per-expert streaming ---------------------------------------------------------------
 
