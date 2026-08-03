@@ -36,7 +36,10 @@ routed experts selected by each V4 MoE layer.
    Cold generation took 47.48 seconds and the identical warm run took 13.27 seconds.
    Prefill loaded 1,305 distinct routed experts across the layers; one-token decode loaded
    exactly 258 (six per layer). Peak allocation/reservation was 1,045/1,050 MiB and peak
-   process RSS was 3.12 GiB. Reproduce with `air_llm/examples/deepseek_v4_full_canary.py`.
+   process RSS was 3.12 GiB. A separate sustained-decode run correctly returned
+   `1, 2, 3, 4, 5` plus EOS over 14 sweeps; its 12 measured warm decode sweeps averaged
+   5.76 seconds/token, held at 258 expert loads each, and kept free VRAM flat. Reproduce
+   the basic full-model gate with `air_llm/examples/deepseek_v4_full_canary.py`.
 
 No pull request or claim of V4 support until gate 4 passes.
 
