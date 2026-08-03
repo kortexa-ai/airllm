@@ -30,7 +30,7 @@ class AirLLMDeepseekV4(AirLLMBaseModel):
     # avoids 43 full GC / CUDA cache purges per generated token without retaining live weights.
     clean_memory_after_layer = False
 
-    def __init__(self, *args, expert_cache_size=0, batched_experts=True, **kwargs):
+    def __init__(self, *args, expert_cache_size=0, **kwargs):
         """Create a V4 adapter, optionally retaining routed experts per layer on the device.
 
         ``expert_cache_size`` is the maximum number of experts retained for each MoE layer. A
@@ -39,7 +39,6 @@ class AirLLMDeepseekV4(AirLLMBaseModel):
         if expert_cache_size < 0:
             raise ValueError('expert_cache_size must be non-negative')
         self.expert_cache_size = expert_cache_size
-        self.batched_experts = batched_experts
         self._expert_cache = {}
         super().__init__(*args, **kwargs)
 
@@ -229,10 +228,8 @@ class AirLLMDeepseekV4(AirLLMBaseModel):
         final = torch.zeros_like(hidden_states)
         with torch.no_grad():
             hit = torch.unique(top_k_index).tolist()
-        loaded = sorted(
-            int(expert_idx) for expert_idx in hit
-            if int(expert_idx) in self._expert_keys[layer_idx]
-        )
+        loaded = [int(expert_idx) for expert_idx in hit
+                  if int(expert_idx) in self._expert_keys[layer_idx]]
         layer_cache = self._expert_cache.setdefault(layer_idx, OrderedDict())
         missing = [expert_idx for expert_idx in loaded if expert_idx not in layer_cache]
 
@@ -254,8 +251,8 @@ class AirLLMDeepseekV4(AirLLMBaseModel):
             if keys else {}
         )
 
-        expert_tensors = {}
         for expert_idx in loaded:
+            token_idx, top_k_pos = torch.where(top_k_index == expert_idx)
             tensors = layer_cache.get(expert_idx)
             if tensors is None:
                 tensors = {
@@ -269,79 +266,20 @@ class AirLLMDeepseekV4(AirLLMBaseModel):
                     layer_cache[expert_idx] = tensors
             else:
                 layer_cache.move_to_end(expert_idx)
-            expert_tensors[expert_idx] = tensors
 
-        can_batch = self.batched_experts and all(
-            tensors[projection]['weight'].element_size() == 1
-            and 'scale' in tensors[projection]
-            for tensors in expert_tensors.values()
-            for projection in ('w1', 'w2', 'w3')
-        )
-        if can_batch:
-            final = self._run_batched_experts(
-                module, hidden_states, top_k_index, top_k_weights, loaded, expert_tensors)
-        else:
-            for expert_idx in loaded:
-                token_idx, top_k_pos = torch.where(top_k_index == expert_idx)
-                tensors = expert_tensors[expert_idx]
-
-                selected = hidden_states[token_idx]
-                gate = self._expert_linear(selected, tensors, 'w1')
-                up = self._expert_linear(selected, tensors, 'w3')
-                if module.limit is not None:
-                    gate = gate.clamp(max=module.limit)
-                    up = up.clamp(min=-module.limit, max=module.limit)
-                current = self._expert_linear(module.act_fn(gate) * up, tensors, 'w2')
-                current = current * top_k_weights[token_idx, top_k_pos, None]
-                final.index_add_(0, token_idx, current.to(final.dtype))
+            selected = hidden_states[token_idx]
+            gate = self._expert_linear(selected, tensors, 'w1')
+            up = self._expert_linear(selected, tensors, 'w3')
+            if module.limit is not None:
+                gate = gate.clamp(max=module.limit)
+                up = up.clamp(min=-module.limit, max=module.limit)
+            current = self._expert_linear(module.act_fn(gate) * up, tensors, 'w2')
+            current = current * top_k_weights[token_idx, top_k_pos, None]
+            final.index_add_(0, token_idx, current.to(final.dtype))
+            del tensors
 
         while len(layer_cache) > self.expert_cache_size:
             layer_cache.popitem(last=False)
 
         module._airllm_last_experts = loaded
         return final
-
-    @staticmethod
-    def _run_batched_experts(
-        module, hidden_states, top_k_index, top_k_weights, loaded, expert_tensors
-    ):
-        from transformers.integrations.finegrained_fp8 import load_finegrained_fp8_kernel
-
-        gate_up_weight = torch.stack([
-            torch.cat((expert_tensors[idx]['w1']['weight'], expert_tensors[idx]['w3']['weight']))
-            for idx in loaded
-        ])
-        gate_up_scale = torch.stack([
-            torch.cat((expert_tensors[idx]['w1']['scale'], expert_tensors[idx]['w3']['scale']))
-            for idx in loaded
-        ])
-        down_weight = torch.stack([expert_tensors[idx]['w2']['weight'] for idx in loaded])
-        down_scale = torch.stack([expert_tensors[idx]['w2']['scale'] for idx in loaded])
-
-        selected_hidden_states = hidden_states.repeat_interleave(top_k_index.size(-1), dim=0)
-        global_ids = torch.tensor(loaded, device=top_k_index.device, dtype=top_k_index.dtype)
-        local_ids = torch.searchsorted(global_ids, top_k_index.reshape(-1))
-        kernel = load_finegrained_fp8_kernel()
-        projected = kernel.batched_matmul(
-            selected_hidden_states,
-            gate_up_weight,
-            gate_up_scale,
-            block_size=None,
-            expert_ids=local_ids,
-        )
-        gate, up = projected.chunk(2, dim=-1)
-        if module.limit is not None:
-            gate = gate.clamp(max=module.limit)
-            up = up.clamp(min=-module.limit, max=module.limit)
-        projected = module.act_fn(gate) * up
-        projected = kernel.batched_matmul(
-            projected,
-            down_weight,
-            down_scale,
-            block_size=None,
-            expert_ids=local_ids,
-        )
-        projected = projected * top_k_weights.reshape(-1, 1).to(projected.dtype)
-        return projected.view(
-            hidden_states.size(0), top_k_index.size(-1), hidden_states.size(-1)
-        ).sum(dim=1).to(hidden_states.dtype)
