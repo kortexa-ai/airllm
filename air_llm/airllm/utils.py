@@ -1,5 +1,6 @@
 import gc
 import json
+import math
 import os
 import ctypes
 import shutil
@@ -117,6 +118,43 @@ def layer_tensor_names(local_path, layer_name):
     """List the tensors in a layer shard without reading any tensor data."""
     with safe_open(str(Path(local_path) / (layer_name + ".safetensors")), framework="pt") as f:
         return list(f.keys())
+
+
+_SAFETENSORS_DTYPE_BYTES = {
+    'BOOL': 1,
+    'U8': 1,
+    'I8': 1,
+    'F8_E4M3': 1,
+    'F8_E4M3FN': 1,
+    'F8_E5M2': 1,
+    'F8_E8M0': 1,
+    'F8_E8M0FNU': 1,
+    'U16': 2,
+    'I16': 2,
+    'F16': 2,
+    'BF16': 2,
+    'U32': 4,
+    'I32': 4,
+    'F32': 4,
+    'U64': 8,
+    'I64': 8,
+    'F64': 8,
+}
+
+
+def layer_tensor_sizes(local_path, layer_name):
+    """Return each tensor's serialized byte size without reading its data."""
+    sizes = {}
+    with safe_open(str(Path(local_path) / (layer_name + ".safetensors")), framework="pt") as f:
+        for key in f.keys():
+            tensor = f.get_slice(key)
+            dtype = tensor.get_dtype()
+            try:
+                element_size = _SAFETENSORS_DTYPE_BYTES[dtype]
+            except KeyError as exc:
+                raise ValueError(f"Unsupported safetensors dtype {dtype!r} for {key}") from exc
+            sizes[key] = math.prod(tensor.get_shape()) * element_size
+    return sizes
 
 
 def load_layer_subset(local_path, layer_name, keys):

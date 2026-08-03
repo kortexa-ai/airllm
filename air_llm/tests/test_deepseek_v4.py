@@ -25,6 +25,7 @@ from airllm import airllm_deepseek_v4 as deepseek_v4_module
 from airllm.airllm_deepseek_v4 import AirLLMDeepseekV4
 from airllm.persist import model_persister as persister_module
 from airllm.persist.safetensor_model_persister import SafetensorModelPersister
+from airllm.utils import layer_tensor_sizes
 
 
 persister_module.model_persister = SafetensorModelPersister()
@@ -102,6 +103,56 @@ def test_packed_fp4_expert_goes_to_native_kernel_without_cpu_dequantization(monk
 
     assert output.shape == (1, 3)
     assert calls == [(torch.int8, torch.uint8, None)]
+
+
+def test_layer_tensor_sizes_reads_metadata_without_materializing_weights():
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory)
+        save_file(
+            {
+                'bf16': torch.zeros(3, 5, dtype=torch.bfloat16),
+                'int8': torch.zeros(7, dtype=torch.int8),
+            },
+            str(root / 'layer.safetensors'),
+        )
+
+        assert layer_tensor_sizes(root, 'layer') == {'bf16': 30, 'int8': 7}
+
+
+def test_max_vram_policy_prefers_residency_then_spends_remainder_on_cache():
+    gib = 1024**3
+    resident, cache_size, working, required = AirLLMDeepseekV4._choose_vram_policy(
+        budget_bytes=16 * gib,
+        allocated_bytes=gib // 2,
+        resident_bytes=8 * gib,
+        largest_streamed_bytes=gib,
+        expert_working_bytes=gib // 10,
+        expert_cache_unit_bytes=gib // 2,
+        max_cache_size=256,
+    )
+
+    assert resident is True
+    assert cache_size == 11
+    assert working == int(1.6 * gib)
+    assert required < 16 * gib
+
+
+def test_max_vram_policy_streams_when_residency_does_not_fit():
+    gib = 1024**3
+    resident, cache_size, working, required = AirLLMDeepseekV4._choose_vram_policy(
+        budget_bytes=4 * gib,
+        allocated_bytes=gib // 2,
+        resident_bytes=8 * gib,
+        largest_streamed_bytes=gib,
+        expert_working_bytes=gib // 10,
+        expert_cache_unit_bytes=gib // 2,
+        max_cache_size=256,
+    )
+
+    assert resident is False
+    assert cache_size == 4
+    assert working == gib + gib // 10
+    assert required < 4 * gib
 
 
 def test_tiny_native_checkpoint_matches_transformers_and_batches_routed_expert_read(monkeypatch):

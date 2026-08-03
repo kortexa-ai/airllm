@@ -1,3 +1,5 @@
+import math
+import numbers
 import re
 from collections import OrderedDict
 from types import MethodType
@@ -6,7 +8,7 @@ import torch
 import torch.nn.functional as F
 
 from .airllm_base import AirLLMBaseModel
-from .utils import layer_tensor_names, load_layer_subset
+from .utils import layer_tensor_sizes, load_layer_subset
 
 
 def _streamed_experts_forward(module, hidden_states, top_k_index, top_k_weights):
@@ -30,21 +32,78 @@ class AirLLMDeepseekV4(AirLLMBaseModel):
     # avoids 43 full GC / CUDA cache purges per generated token without retaining live weights.
     clean_memory_after_layer = False
 
-    def __init__(self, *args, expert_cache_size=0, resident_non_expert_weights=False, **kwargs):
+    def __init__(
+        self,
+        *args,
+        expert_cache_size=0,
+        resident_non_expert_weights=False,
+        max_vram_gb=None,
+        **kwargs,
+    ):
         """Create a V4 adapter, optionally retaining routed experts per layer on the device.
 
-        ``expert_cache_size`` is the maximum number of experts retained for each MoE layer. A
-        value of zero preserves AirLLM's minimum-memory behavior.
+        ``max_vram_gb`` selects ordinary-weight residency and a bounded expert cache from the
+        checkpoint's actual tensor sizes. ``expert_cache_size`` and
+        ``resident_non_expert_weights`` remain explicit advanced overrides.
         """
         if expert_cache_size < 0:
             raise ValueError('expert_cache_size must be non-negative')
+        if max_vram_gb is not None:
+            if (
+                isinstance(max_vram_gb, bool)
+                or not isinstance(max_vram_gb, numbers.Real)
+                or not math.isfinite(max_vram_gb)
+                or max_vram_gb <= 0
+            ):
+                raise ValueError('max_vram_gb must be a positive finite number')
+            if expert_cache_size or resident_non_expert_weights:
+                raise ValueError(
+                    'max_vram_gb cannot be combined with expert_cache_size or '
+                    'resident_non_expert_weights'
+                )
         self.expert_cache_size = expert_cache_size
         self.resident_non_expert_weights = resident_non_expert_weights
+        self.max_vram_gb = float(max_vram_gb) if max_vram_gb is not None else None
+        self.vram_policy = None
         self._expert_cache = {}
+        self._layer_tensor_sizes = {}
         super().__init__(*args, **kwargs)
 
     def _keep_streamed_layer_resident(self, idx):
         return self.resident_non_expert_weights
+
+    @staticmethod
+    def _choose_vram_policy(
+        budget_bytes,
+        allocated_bytes,
+        resident_bytes,
+        largest_streamed_bytes,
+        expert_working_bytes,
+        expert_cache_unit_bytes,
+        max_cache_size,
+    ):
+        """Choose residency and a per-layer cache size within a byte budget."""
+        headroom = max(1024**3, int(budget_bytes * 0.10))
+        resident_working = max(headroom, expert_working_bytes)
+        keep_resident = allocated_bytes + resident_bytes + resident_working <= budget_bytes
+
+        if keep_resident:
+            fixed = allocated_bytes + resident_bytes
+            working = resident_working
+        else:
+            fixed = allocated_bytes
+            working = max(headroom, largest_streamed_bytes + expert_working_bytes)
+
+        required = fixed + working
+        if required > budget_bytes:
+            return False, 0, working, required
+
+        cache_bytes = budget_bytes - required
+        cache_size = (
+            min(max_cache_size, cache_bytes // expert_cache_unit_bytes)
+            if expert_cache_unit_bytes else 0
+        )
+        return keep_resident, int(cache_size), working, required
 
     def set_layer_names_dict(self):
         self.layer_names_dict = {
@@ -165,9 +224,10 @@ class AirLLMDeepseekV4(AirLLMBaseModel):
                 continue
             checkpoint_name = self._checkpoint_layer_name(layer_name)
             try:
-                names = layer_tensor_names(self.checkpoint_path, checkpoint_name)
+                tensor_sizes = layer_tensor_sizes(self.checkpoint_path, checkpoint_name)
             except Exception:
                 continue
+            names = tensor_sizes.keys()
 
             experts = {}
             others = []
@@ -190,6 +250,7 @@ class AirLLMDeepseekV4(AirLLMBaseModel):
             expert_module.forward = MethodType(_streamed_experts_forward, expert_module)
             self._expert_keys[idx] = experts
             self._non_expert_keys[idx] = others
+            self._layer_tensor_sizes[idx] = tensor_sizes
             hooked += len(experts)
 
         if hooked:
@@ -201,6 +262,98 @@ class AirLLMDeepseekV4(AirLLMBaseModel):
             self.model.config._experts_implementation_internal = 'eager'
             print(f"DeepSeek V4 selective expert streaming enabled: {hooked} experts across "
                   f"{len(self._expert_keys)} layers; only routed experts are read from disk.")
+
+    def _configure_streaming_policy(self):
+        if self.max_vram_gb is None:
+            return
+        if self.device.type != 'cuda':
+            raise ValueError('max_vram_gb requires a CUDA device')
+
+        budget_bytes = int(self.max_vram_gb * 1024**3)
+        total_bytes = torch.cuda.get_device_properties(self.device).total_memory
+        if budget_bytes > total_bytes:
+            raise ValueError(
+                f"max_vram_gb={self.max_vram_gb:g} exceeds this device's "
+                f"{total_bytes / 1024**3:.2f} GiB of VRAM"
+            )
+
+        allocated_bytes = torch.cuda.memory_allocated(self.device)
+        resident_bytes = 0
+        largest_streamed_bytes = 0
+        for idx in self._streamed_indices:
+            sizes = self._layer_tensor_sizes.get(idx)
+            if sizes is None:
+                checkpoint_name = self._checkpoint_layer_name(self.layer_names[idx])
+                sizes = layer_tensor_sizes(self.checkpoint_path, checkpoint_name)
+                self._layer_tensor_sizes[idx] = sizes
+            keys = self._non_expert_keys.get(idx, sizes.keys())
+            module_bytes = sum(
+                sizes[key] for key in keys if self._translate_key(key) is not None
+            )
+            resident_bytes += module_bytes
+            largest_streamed_bytes = max(largest_streamed_bytes, module_bytes)
+
+        expert_cache_unit_bytes = 0
+        expert_working_bytes = 0
+        max_cache_size = None
+        for idx, experts in self._expert_keys.items():
+            sizes = self._layer_tensor_sizes[idx]
+            expert_sizes = [
+                sum(
+                    sizes[key]
+                    for projection in parts.values()
+                    for key in projection.values()
+                )
+                for parts in experts.values()
+            ]
+            largest_expert = max(expert_sizes)
+            expert_cache_unit_bytes += largest_expert
+            expert_working_bytes = max(
+                expert_working_bytes,
+                largest_expert * self.config.num_experts_per_tok,
+            )
+            layer_cache_limit = len(experts)
+            max_cache_size = (
+                layer_cache_limit
+                if max_cache_size is None
+                else min(max_cache_size, layer_cache_limit)
+            )
+
+        keep_resident, cache_size, working_bytes, required_bytes = self._choose_vram_policy(
+            budget_bytes=budget_bytes,
+            allocated_bytes=allocated_bytes,
+            resident_bytes=resident_bytes,
+            largest_streamed_bytes=largest_streamed_bytes,
+            expert_working_bytes=expert_working_bytes,
+            expert_cache_unit_bytes=expert_cache_unit_bytes,
+            max_cache_size=max_cache_size or 0,
+        )
+        if required_bytes > budget_bytes:
+            raise ValueError(
+                f"max_vram_gb={self.max_vram_gb:g} is too small; this checkpoint needs an "
+                f"estimated minimum of {required_bytes / 1024**3:.2f} GiB"
+            )
+
+        device_index = self.device.index
+        if device_index is None:
+            device_index = torch.cuda.current_device()
+        torch.cuda.set_per_process_memory_fraction(budget_bytes / total_bytes, device_index)
+
+        self.resident_non_expert_weights = keep_resident
+        self.expert_cache_size = cache_size
+        self.vram_policy = {
+            'max_vram_gb': self.max_vram_gb,
+            'resident_non_expert_weights': keep_resident,
+            'expert_cache_size': cache_size,
+            'estimated_resident_gb': resident_bytes / 1024**3,
+            'reserved_working_gb': working_bytes / 1024**3,
+        }
+        mode = 'resident' if keep_resident else 'streamed'
+        print(
+            f"DeepSeek V4 {self.max_vram_gb:g} GiB policy: {mode} ordinary weights, "
+            f"{cache_size} cached experts per layer, "
+            f"{working_bytes / 1024**3:.2f} GiB working headroom."
+        )
 
     def _load_streamed_layer(self, idx):
         keys = self._non_expert_keys.get(idx) if self._expert_streaming else None

@@ -630,6 +630,7 @@ class AirLLMBaseModel:
         self._streamed_set = set(self._streamed_indices)
 
         self._setup_expert_streaming()
+        self._configure_streaming_policy()
 
         resident_indices = [
             idx for idx in self._streamed_indices if self._keep_streamed_layer_resident(idx)
@@ -652,6 +653,10 @@ class AirLLMBaseModel:
     def _keep_streamed_layer_resident(self, idx):
         """Return whether a normally streamed module should instead remain on the device."""
         return False
+
+    def _configure_streaming_policy(self):
+        """Allow adapters to size residency and caches after checkpoint inspection."""
+        return None
 
     # ---- per-expert streaming ---------------------------------------------------------------
 

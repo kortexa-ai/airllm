@@ -35,18 +35,38 @@ def main():
     parser.add_argument("--prefetching", action="store_true")
     parser.add_argument("--expert-cache-size", type=int, default=0)
     parser.add_argument("--resident-non-expert-weights", action="store_true")
+    parser.add_argument("--max-vram-gb", type=float)
     parser.add_argument("--profile", action="store_true")
     args = parser.parse_args()
+    if args.max_vram_gb is not None and (
+        args.expert_cache_size or args.resident_non_expert_weights
+    ):
+        parser.error(
+            "--max-vram-gb cannot be combined with --expert-cache-size or "
+            "--resident-non-expert-weights"
+        )
+    if args.max_vram_gb is not None and args.max_vram_gb <= 0:
+        parser.error("--max-vram-gb must be positive")
 
     device = torch.device("cuda:0")
     torch.cuda.set_device(device)
     free_before, total = torch.cuda.mem_get_info(device)
-    if free_before < MIN_FREE_GIB * 2**30:
+    minimum_free_gib = args.max_vram_gb if args.max_vram_gb is not None else MIN_FREE_GIB
+    if free_before < minimum_free_gib * 2**30:
         raise SystemExit(
-            f"ABORT: requires {MIN_FREE_GIB} GiB free VRAM; "
+            f"ABORT: requires {minimum_free_gib:g} GiB free VRAM; "
             f"only {free_before / 2**30:.2f} GiB is available"
         )
-    torch.cuda.set_per_process_memory_fraction(ALLOCATOR_FRACTION, device.index)
+    allocator_fraction = (
+        args.max_vram_gb * 2**30 / total
+        if args.max_vram_gb is not None
+        else ALLOCATOR_FRACTION
+    )
+    if allocator_fraction > 1:
+        parser.error(
+            f"--max-vram-gb exceeds this device's {total / 2**30:.2f} GiB of VRAM"
+        )
+    torch.cuda.set_per_process_memory_fraction(allocator_fraction, device.index)
 
     sys.path.insert(0, str(args.model_path / "encoding"))
     from encoding_dsv4 import encode_messages
@@ -59,6 +79,7 @@ def main():
         prefetching=args.prefetching,
         expert_cache_size=args.expert_cache_size,
         resident_non_expert_weights=args.resident_non_expert_weights,
+        max_vram_gb=args.max_vram_gb,
     )
     prompt = encode_messages([{"role": "user", "content": args.prompt}], thinking_mode="chat")
     prompt_ids = model.tokenizer.encode(prompt, return_tensors="pt").to(device)
@@ -221,11 +242,13 @@ def main():
         "encoded_prompt_tokens": int(prompt_ids.shape[-1]),
         "max_new_tokens": args.max_new_tokens,
         "prefetching": args.prefetching,
-        "expert_cache_size": args.expert_cache_size,
-        "resident_non_expert_weights": args.resident_non_expert_weights,
+        "expert_cache_size": model.expert_cache_size,
+        "resident_non_expert_weights": model.resident_non_expert_weights,
+        "max_vram_gb": args.max_vram_gb,
+        "vram_policy": model.vram_policy,
         "profile": args.profile,
         "free_before_gib": round(free_before / 2**30, 3),
-        "allocator_cap_gib": round(total * ALLOCATOR_FRACTION / 2**30, 3),
+        "allocator_cap_gib": round(total * allocator_fraction / 2**30, 3),
         "peak_rss_gib": round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 2**20, 3),
         "runs": runs,
         "pass_records": pass_records,
