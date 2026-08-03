@@ -213,23 +213,38 @@ class AirLLMDeepseekV4(AirLLMBaseModel):
             return F.linear(inputs, weight.to(inputs.dtype))
 
         scale = scale.to(inputs.device)
-        from transformers.integrations.finegrained_fp8 import fp8_linear
+        if not hasattr(self, '_fp8_linear'):
+            from transformers.integrations.finegrained_fp8 import fp8_linear
 
-        quantization_config = getattr(self.config, 'quantization_config', None)
-        if isinstance(quantization_config, dict):
-            configured_block_size = quantization_config.get('weight_block_size', (128, 128))
+            self._fp8_linear = fp8_linear
+
+        if weight.dtype == torch.int8:
+            block_size = None
         else:
-            configured_block_size = getattr(quantization_config, 'weight_block_size', (128, 128))
-        block_size = None if weight.dtype == torch.int8 else tuple(configured_block_size)
-        return fp8_linear(inputs, weight, scale, block_size=block_size)
+            quantization_config = getattr(self.config, 'quantization_config', None)
+            if isinstance(quantization_config, dict):
+                configured = quantization_config.get('weight_block_size', (128, 128))
+            else:
+                configured = getattr(quantization_config, 'weight_block_size', (128, 128))
+            block_size = tuple(configured)
+        return self._fp8_linear(inputs, weight, scale, block_size=block_size)
 
     def _run_streamed_experts(self, module, hidden_states, top_k_index, top_k_weights):
         layer_idx = module._airllm_layer_idx
         final = torch.zeros_like(hidden_states)
-        with torch.no_grad():
-            hit = torch.unique(top_k_index).tolist()
-        loaded = [int(expert_idx) for expert_idx in hit
-                  if int(expert_idx) in self._expert_keys[layer_idx]]
+        single_token = hidden_states.size(0) == 1
+        if single_token:
+            routes = sorted(
+                (int(expert_idx), top_k_pos)
+                for top_k_pos, expert_idx in enumerate(top_k_index[0].tolist())
+                if int(expert_idx) in self._expert_keys[layer_idx]
+            )
+            loaded = [expert_idx for expert_idx, _ in routes]
+        else:
+            with torch.no_grad():
+                hit = torch.unique(top_k_index).tolist()
+            loaded = [int(expert_idx) for expert_idx in hit
+                      if int(expert_idx) in self._expert_keys[layer_idx]]
         layer_cache = self._expert_cache.setdefault(layer_idx, OrderedDict())
         missing = [expert_idx for expert_idx in loaded if expert_idx not in layer_cache]
 
@@ -251,8 +266,7 @@ class AirLLMDeepseekV4(AirLLMBaseModel):
             if keys else {}
         )
 
-        for expert_idx in loaded:
-            token_idx, top_k_pos = torch.where(top_k_index == expert_idx)
+        for loaded_pos, expert_idx in enumerate(loaded):
             tensors = layer_cache.get(expert_idx)
             if tensors is None:
                 tensors = {
@@ -267,15 +281,23 @@ class AirLLMDeepseekV4(AirLLMBaseModel):
             else:
                 layer_cache.move_to_end(expert_idx)
 
-            selected = hidden_states[token_idx]
+            if single_token:
+                selected = hidden_states
+            else:
+                token_idx, top_k_pos = torch.where(top_k_index == expert_idx)
+                selected = hidden_states[token_idx]
             gate = self._expert_linear(selected, tensors, 'w1')
             up = self._expert_linear(selected, tensors, 'w3')
             if module.limit is not None:
                 gate = gate.clamp(max=module.limit)
                 up = up.clamp(min=-module.limit, max=module.limit)
             current = self._expert_linear(module.act_fn(gate) * up, tensors, 'w2')
-            current = current * top_k_weights[token_idx, top_k_pos, None]
-            final.index_add_(0, token_idx, current.to(final.dtype))
+            if single_token:
+                route_weight = top_k_weights[0, routes[loaded_pos][1]]
+                final.add_((current * route_weight).to(final.dtype))
+            else:
+                current = current * top_k_weights[token_idx, top_k_pos, None]
+                final.index_add_(0, token_idx, current.to(final.dtype))
             del tensors
 
         while len(layer_cache) > self.expert_cache_size:
