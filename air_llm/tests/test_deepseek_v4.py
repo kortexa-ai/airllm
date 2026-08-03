@@ -124,7 +124,12 @@ def test_tiny_native_checkpoint_matches_transformers_and_batches_routed_expert_r
         config.save_pretrained(root)
 
         model = _TokenizerlessV4(
-            root, device='cpu', dtype=torch.float32, prefetching=False)
+            root,
+            device='cpu',
+            dtype=torch.float32,
+            prefetching=False,
+            expert_cache_size=config.num_experts_per_tok,
+        )
         expert_reads = []
         original_load_subset = deepseek_v4_module.load_layer_subset
 
@@ -136,8 +141,10 @@ def test_tiny_native_checkpoint_matches_transformers_and_batches_routed_expert_r
         monkeypatch.setattr(deepseek_v4_module, 'load_layer_subset', counted_load_subset)
         with torch.no_grad():
             actual = model.model(input_ids, use_cache=False).logits
+            cached = model.model(input_ids, use_cache=False).logits
 
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        torch.testing.assert_close(cached, expected, rtol=0, atol=0)
         loaded = model.model.model.layers[0].mlp.experts._airllm_last_experts
         assert len(loaded) == config.num_experts_per_tok
         assert len(loaded) < config.n_routed_experts

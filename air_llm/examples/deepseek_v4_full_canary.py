@@ -32,6 +32,7 @@ def main():
     parser.add_argument("--runs", type=int, default=2)
     parser.add_argument("--expect-prefix", default="Paris")
     parser.add_argument("--prefetching", action="store_true")
+    parser.add_argument("--expert-cache-size", type=int, default=0)
     args = parser.parse_args()
 
     device = torch.device("cuda:0")
@@ -53,6 +54,7 @@ def main():
         dtype=torch.bfloat16,
         max_seq_len=64,
         prefetching=args.prefetching,
+        expert_cache_size=args.expert_cache_size,
     )
     prompt = encode_messages([{"role": "user", "content": args.prompt}], thinking_mode="chat")
     prompt_ids = model.tokenizer.encode(prompt, return_tensors="pt").to(device)
@@ -152,6 +154,7 @@ def main():
         "encoded_prompt_tokens": int(prompt_ids.shape[-1]),
         "max_new_tokens": args.max_new_tokens,
         "prefetching": args.prefetching,
+        "expert_cache_size": args.expert_cache_size,
         "free_before_gib": round(free_before / 2**30, 3),
         "allocator_cap_gib": round(total * ALLOCATOR_FRACTION / 2**30, 3),
         "peak_rss_gib": round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 2**20, 3),

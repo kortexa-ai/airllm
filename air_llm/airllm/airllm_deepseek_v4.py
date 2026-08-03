@@ -1,4 +1,5 @@
 import re
+from collections import OrderedDict
 from types import MethodType
 
 import torch
@@ -28,6 +29,18 @@ class AirLLMDeepseekV4(AirLLMBaseModel):
     # V4 releases each streamed layer before advancing. Keeping the allocator's blocks cached
     # avoids 43 full GC / CUDA cache purges per generated token without retaining live weights.
     clean_memory_after_layer = False
+
+    def __init__(self, *args, expert_cache_size=0, **kwargs):
+        """Create a V4 adapter, optionally retaining routed experts per layer on the device.
+
+        ``expert_cache_size`` is the maximum number of experts retained for each MoE layer. A
+        value of zero preserves AirLLM's minimum-memory behavior.
+        """
+        if expert_cache_size < 0:
+            raise ValueError('expert_cache_size must be non-negative')
+        self.expert_cache_size = expert_cache_size
+        self._expert_cache = {}
+        super().__init__(*args, **kwargs)
 
     def set_layer_names_dict(self):
         self.layer_names_dict = {
@@ -217,25 +230,42 @@ class AirLLMDeepseekV4(AirLLMBaseModel):
             hit = torch.unique(top_k_index).tolist()
         loaded = [int(expert_idx) for expert_idx in hit
                   if int(expert_idx) in self._expert_keys[layer_idx]]
+        layer_cache = self._expert_cache.setdefault(layer_idx, OrderedDict())
+        missing = [expert_idx for expert_idx in loaded if expert_idx not in layer_cache]
 
         # Opening a V4 layer shard requires parsing its very large tensor index. Fetch every
         # routed expert through one handle, then execute them individually to keep the simple
         # batch-1 kernel path and bounded memory use.
         keys = [
             key
-            for expert_idx in loaded
+            for expert_idx in missing
             for projection in self._expert_keys[layer_idx][expert_idx].values()
             for key in projection.values()
         ]
-        raw = load_layer_subset(
-            self.checkpoint_path, self._checkpoint_layer_name(self.layer_names[layer_idx]), keys)
+        raw = (
+            load_layer_subset(
+                self.checkpoint_path,
+                self._checkpoint_layer_name(self.layer_names[layer_idx]),
+                keys,
+            )
+            if keys else {}
+        )
 
         for expert_idx in loaded:
             token_idx, top_k_pos = torch.where(top_k_index == expert_idx)
-            tensors = {
-                projection: {kind: raw[key] for kind, key in parts.items()}
-                for projection, parts in self._expert_keys[layer_idx][expert_idx].items()
-            }
+            tensors = layer_cache.get(expert_idx)
+            if tensors is None:
+                tensors = {
+                    projection: {
+                        kind: raw[key].to(hidden_states.device)
+                        for kind, key in parts.items()
+                    }
+                    for projection, parts in self._expert_keys[layer_idx][expert_idx].items()
+                }
+                if self.expert_cache_size:
+                    layer_cache[expert_idx] = tensors
+            else:
+                layer_cache.move_to_end(expert_idx)
 
             selected = hidden_states[token_idx]
             gate = self._expert_linear(selected, tensors, 'w1')
@@ -247,6 +277,9 @@ class AirLLMDeepseekV4(AirLLMBaseModel):
             current = current * top_k_weights[token_idx, top_k_pos, None]
             final.index_add_(0, token_idx, current.to(final.dtype))
             del tensors
+
+        while len(layer_cache) > self.expert_cache_size:
+            layer_cache.popitem(last=False)
 
         module._airllm_last_experts = loaded
         return final
