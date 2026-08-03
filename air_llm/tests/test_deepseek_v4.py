@@ -150,8 +150,8 @@ def test_max_vram_policy_streams_when_residency_does_not_fit():
     )
 
     assert resident is False
-    assert cache_size == 4
-    assert working == gib + gib // 10
+    assert cache_size == 2
+    assert working == 2 * gib + gib // 10
     assert required < 4 * gib
 
 

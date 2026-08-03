@@ -92,7 +92,9 @@ class AirLLMDeepseekV4(AirLLMBaseModel):
             working = resident_working
         else:
             fixed = allocated_bytes
-            working = max(headroom, largest_streamed_bytes + expert_working_bytes)
+            # Streaming briefly needs the largest ordinary module (usually the language head)
+            # alongside routed-expert workspace and allocator/KV headroom.
+            working = headroom + largest_streamed_bytes + expert_working_bytes
 
         required = fixed + working
         if required > budget_bytes:
