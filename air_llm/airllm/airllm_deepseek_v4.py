@@ -218,9 +218,18 @@ class AirLLMDeepseekV4(AirLLMBaseModel):
 
         scale = scale.to(inputs.device)
         if not hasattr(self, '_fp8_linear'):
-            from transformers.integrations.finegrained_fp8 import fp8_linear
+            from transformers.integrations.finegrained_fp8 import (
+                finegrained_fp8_linear,
+                fp8_linear,
+            )
 
-            self._fp8_linear = fp8_linear
+            # The current DeepGEMM integration accepts SM90/SM100 but rejects SM120. Bypass its
+            # exception-driven dispatcher there and call the same Triton fallback directly.
+            is_sm12x = (
+                inputs.device.type == 'cuda'
+                and torch.cuda.get_device_capability(inputs.device)[0] == 12
+            )
+            self._fp8_linear = finegrained_fp8_linear if is_sm12x else fp8_linear
 
         if weight.dtype == torch.int8:
             block_size = None
