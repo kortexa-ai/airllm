@@ -41,19 +41,27 @@ routed experts selected by each V4 MoE layer.
    5.76 seconds/token, held at 258 expert loads each, and kept free VRAM flat. Reproduce
    the basic full-model gate with `air_llm/examples/deepseek_v4_full_canary.py`.
 
-No pull request or claim of V4 support until gate 4 passes.
+Gate 4 is complete. Keep the upstream pull request deferred until the optimized path has broader
+prompt/context coverage and user-facing documentation.
 
 ## Performance pass
 
-Baseline sustained decode is 5.76 seconds/token with 258 expert loads per token and about
-1.8 GiB of total incremental VRAM use. Optimize and measure in this order:
+The fresh control measured 5.21 seconds/token. The completed performance pass produced:
 
-1. Attribute warm-layer time to expert file reads, host-to-device copies, kernels, and cleanup.
-2. Remove unnecessary per-layer garbage collection and CUDA allocator purges while preserving
-   a bounded, stable memory footprint.
-3. Read all routed experts for a layer through one safetensors open rather than one open per
-   expert.
-4. Measure expert reuse before adding a bounded resident cache or broader prefetching.
+- Skipping V4's unnecessary per-layer GC and CUDA cache purge: 1.92 seconds/token.
+- Reading all routed experts through one safetensors open per layer: 1.73 seconds/token.
+- A single-token routing fast path: 1.69 seconds/token at the minimum ~1 GiB allocation.
+- Keeping 8.5 GiB of ordinary/non-expert weights resident: 0.63 seconds/token.
+- Resident ordinary weights plus a 64-expert-per-layer LRU: 0.272 seconds/token (3.68 tokens/s)
+  averaged across 13 sustained decode sweeps. The last five cache-warm tokens averaged 0.225
+  seconds/token (4.44 tokens/s). Peak allocation/reservation was 36.0/36.0 GiB and host RSS was
+  3.02 GiB; output remained `1, 2, 3, 4, 5` plus EOS.
+
+Existing next-layer prefetching regressed to 1.85 seconds/token. A six-expert batched Triton path
+regressed to 1.81 seconds/token, and fusing each expert's gate/up projections regressed the final
+configuration to 0.290 seconds/token, so all three experiments were left out. Cache size 72 was
+indistinguishable from 64. Further material gains now require kernel/graph work or broader serving
+changes rather than more file-I/O tuning.
 
 ## Deferred
 
