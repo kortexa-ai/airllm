@@ -63,6 +63,28 @@ configuration to 0.290 seconds/token, so all three experiments were left out. Ca
 indistinguishable from 64. Further material gains now require kernel/graph work or broader serving
 changes rather than more file-I/O tuning.
 
+## Automatic VRAM policy
+
+The public numeric `max_vram_gb` option is implemented. It reads tensor sizes from safetensors
+metadata, applies a hard PyTorch allocator cap, reserves execution/KV headroom, and automatically
+chooses ordinary-weight residency plus a per-layer expert-cache size. The explicit
+`expert_cache_size` and `resident_non_expert_weights` controls remain available for experiments,
+but cannot be combined with the automatic budget.
+
+End-to-end capped runs on the released checkpoint passed at three tiers:
+
+- 4 GiB: streamed ordinary weights, cache 3 experts/layer, 3.22 GiB peak reservation, about
+  0.62 tokens/s.
+- 14 GiB: resident ordinary weights, cache 8 experts/layer, 13.06 GiB peak reservation, about
+  2.16 tokens/s.
+- 40 GiB: resident ordinary weights, cache 51 experts/layer, 33.85 GiB peak reservation, about
+  3.65 tokens/s.
+
+The 4 GiB run also exercised the smallest policy branch and caught an initially missing additive
+workspace reservation; the corrected policy reserves the largest streamed ordinary module and
+routed-expert workspace concurrently. These are allocator-cap tests on the 96 GiB SM120 card, not
+substitutes for architecture testing on native low-memory GPUs.
+
 ## Deferred
 
 - DSpark speculative decoding.

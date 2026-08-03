@@ -171,6 +171,40 @@ When initialize the model, we support the following configurations:
 * **hf_token**: huggingface token can be provided here if downloading gated models like: *meta-llama/Llama-2-7b-hf*
 * **prefetching**: prefetching to overlap the model loading and compute. By default, turned on. For now, only AirLLMLlama2 supports this.
 * **delete_original**: if you don't have too much disk space, you can set delete_original to true to delete the original downloaded hugging face model, only keep the transformed one to save half of the disk space. 
+* **max_vram_gb**: for DeepSeek V4, set a numeric per-process CUDA memory budget. AirLLM uses the checkpoint's tensor sizes to decide whether to keep ordinary weights resident and how many routed experts to cache per layer. Do not combine it with the advanced `expert_cache_size` or `resident_non_expert_weights` overrides.
+
+### DeepSeek V4 VRAM budget
+
+Install the V4 kernel dependency and pass the budget through `AutoModel`:
+
+```bash
+pip install 'airllm[deepseek-v4]'
+```
+
+```python
+from airllm import AutoModel
+
+model = AutoModel.from_pretrained(
+    "/path/to/DeepSeek-V4-Flash",
+    max_vram_gb=14,
+)
+```
+
+The value is a hard allocator limit for the whole PyTorch process, measured in GiB despite the
+argument's shorter `gb` name. AirLLM reserves at least 10% (and at least 1 GiB) for execution and
+KV-cache headroom, then spends the remainder on ordinary-weight residency and a bounded expert
+cache. Longer contexts and other CUDA allocations may require a larger budget.
+
+On the released V4 Flash checkpoint, an SM120 RTX PRO 6000 test selected the following policies:
+
+| `max_vram_gb` | Selected policy | Measured peak | Warm decode |
+| ---: | --- | ---: | ---: |
+| 4 | stream ordinary weights, cache 3 experts/layer | 3.22 GiB | ~0.62 tokens/s |
+| 14 | keep ordinary weights resident, cache 8 experts/layer | 13.06 GiB | ~2.16 tokens/s |
+| 40 | keep ordinary weights resident, cache 51 experts/layer | 33.85 GiB | ~3.65 tokens/s |
+
+These measurements emulate smaller VRAM budgets on a 96 GiB SM120 GPU; they do not establish
+kernel compatibility or identical speed on a physical 4/16/40 GiB card.
 
 ## MacOS
 
