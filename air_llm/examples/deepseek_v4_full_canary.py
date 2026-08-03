@@ -15,6 +15,7 @@ from types import MethodType
 
 import torch
 
+from airllm import airllm_deepseek_v4 as deepseek_v4_module
 from airllm.airllm_deepseek_v4 import AirLLMDeepseekV4
 
 
@@ -33,6 +34,7 @@ def main():
     parser.add_argument("--expect-prefix", default="Paris")
     parser.add_argument("--prefetching", action="store_true")
     parser.add_argument("--expert-cache-size", type=int, default=0)
+    parser.add_argument("--profile", action="store_true")
     args = parser.parse_args()
 
     device = torch.device("cuda:0")
@@ -67,6 +69,10 @@ def main():
         "expert_routes": set(),
         "previous_expert_routes": None,
         "sweep_started": None,
+        "expert_read_seconds": 0.0,
+        "non_expert_load_seconds": 0.0,
+        "expert_host_seconds": 0.0,
+        "expert_cuda_events": [],
     }
     pass_records = []
     original_experts = model._run_streamed_experts
@@ -76,29 +82,84 @@ def main():
         state["expert_loads"] += len(routed)
         state["expert_routes"].update(
             (module._airllm_layer_idx, expert_idx) for expert_idx in routed)
-        return original_experts(module, hidden_states, top_k_index, top_k_weights)
+        started = time.perf_counter()
+        result = original_experts(module, hidden_states, top_k_index, top_k_weights)
+        state["expert_host_seconds"] += time.perf_counter() - started
+        return result
+
+    if args.profile:
+        original_subset = deepseek_v4_module.load_layer_subset
+
+        def timed_subset(local_path, layer_name, keys):
+            started = time.perf_counter()
+            result = original_subset(local_path, layer_name, keys)
+            if any('.experts.' in key for key in keys):
+                state["expert_read_seconds"] += time.perf_counter() - started
+            return result
+
+        deepseek_v4_module.load_layer_subset = timed_subset
+
+        original_streamed_layer = model._load_streamed_layer
+
+        def timed_streamed_layer(self, idx):
+            started = time.perf_counter()
+            result = original_streamed_layer(idx)
+            state["non_expert_load_seconds"] += time.perf_counter() - started
+            return result
+
+        model._load_streamed_layer = MethodType(timed_streamed_layer, model)
+
+        original_linear = model._expert_linear
+
+        def timed_linear(self, inputs, tensors, projection):
+            started = torch.cuda.Event(enable_timing=True)
+            finished = torch.cuda.Event(enable_timing=True)
+            started.record()
+            result = original_linear(inputs, tensors, projection)
+            finished.record()
+            state["expert_cuda_events"].append((started, finished))
+            return result
+
+        model._expert_linear = MethodType(timed_linear, model)
 
     def completed_sweep(module, hook_args, output):
+        if args.profile:
+            torch.cuda.synchronize(device)
         now = time.perf_counter()
         previous = state["previous_expert_routes"]
         reused = len(state["expert_routes"] & previous) if previous is not None else None
+        sweep_seconds = now - state["sweep_started"]
         state["passes"] += 1
-        pass_records.append(
-            {
-                "run": state["run"],
-                "pass": state["passes"],
-                "distinct_expert_loads": state["expert_loads"],
-                "expert_routes_reused": reused,
-                "expert_route_reuse_fraction": (
-                    round(reused / len(state["expert_routes"]), 3) if reused is not None else None
-                ),
-                "seconds_since_previous_sweep": round(now - state["sweep_started"], 3),
+        record = {
+            "run": state["run"],
+            "pass": state["passes"],
+            "distinct_expert_loads": state["expert_loads"],
+            "expert_routes_reused": reused,
+            "expert_route_reuse_fraction": (
+                round(reused / len(state["expert_routes"]), 3) if reused is not None else None
+            ),
+            "seconds_since_previous_sweep": round(sweep_seconds, 3),
+        }
+        if args.profile:
+            expert_cuda_seconds = sum(
+                started.elapsed_time(finished)
+                for started, finished in state["expert_cuda_events"]
+            ) / 1000
+            record["profile"] = {
+                "expert_read_seconds": round(state["expert_read_seconds"], 3),
+                "non_expert_load_seconds": round(state["non_expert_load_seconds"], 3),
+                "expert_host_seconds": round(state["expert_host_seconds"], 3),
+                "expert_cuda_seconds": round(expert_cuda_seconds, 3),
             }
-        )
+        pass_records.append(record)
         state["expert_loads"] = 0
         state["previous_expert_routes"] = state["expert_routes"]
         state["expert_routes"] = set()
         state["sweep_started"] = now
+        state["expert_read_seconds"] = 0.0
+        state["non_expert_load_seconds"] = 0.0
+        state["expert_host_seconds"] = 0.0
+        state["expert_cuda_events"] = []
 
     model._run_streamed_experts = MethodType(counted_experts, model)
     model.model.model.layers[-1].register_forward_hook(completed_sweep)
@@ -113,6 +174,10 @@ def main():
             expert_routes=set(),
             previous_expert_routes=None,
             sweep_started=time.perf_counter(),
+            expert_read_seconds=0.0,
+            non_expert_load_seconds=0.0,
+            expert_host_seconds=0.0,
+            expert_cuda_events=[],
         )
         torch.cuda.reset_peak_memory_stats(device)
         started = time.perf_counter()
@@ -155,6 +220,7 @@ def main():
         "max_new_tokens": args.max_new_tokens,
         "prefetching": args.prefetching,
         "expert_cache_size": args.expert_cache_size,
+        "profile": args.profile,
         "free_before_gib": round(free_before / 2**30, 3),
         "allocator_cap_gib": round(total * ALLOCATOR_FRACTION / 2**30, 3),
         "peak_rss_gib": round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 2**20, 3),
