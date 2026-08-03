@@ -31,6 +31,7 @@ def main():
     parser.add_argument("--max-new-tokens", type=int, default=MAX_NEW_TOKENS)
     parser.add_argument("--runs", type=int, default=2)
     parser.add_argument("--expect-prefix", default="Paris")
+    parser.add_argument("--prefetching", action="store_true")
     args = parser.parse_args()
 
     device = torch.device("cuda:0")
@@ -51,32 +52,50 @@ def main():
         device=str(device),
         dtype=torch.bfloat16,
         max_seq_len=64,
-        prefetching=False,
+        prefetching=args.prefetching,
     )
     prompt = encode_messages([{"role": "user", "content": args.prompt}], thinking_mode="chat")
     prompt_ids = model.tokenizer.encode(prompt, return_tensors="pt").to(device)
     attention_mask = torch.ones_like(prompt_ids)
 
-    state = {"run": 0, "passes": 0, "expert_loads": 0, "sweep_started": None}
+    state = {
+        "run": 0,
+        "passes": 0,
+        "expert_loads": 0,
+        "expert_routes": set(),
+        "previous_expert_routes": None,
+        "sweep_started": None,
+    }
     pass_records = []
     original_experts = model._run_streamed_experts
 
     def counted_experts(self, module, hidden_states, top_k_index, top_k_weights):
-        state["expert_loads"] += int(torch.unique(top_k_index).numel())
+        routed = {int(expert_idx) for expert_idx in torch.unique(top_k_index).tolist()}
+        state["expert_loads"] += len(routed)
+        state["expert_routes"].update(
+            (module._airllm_layer_idx, expert_idx) for expert_idx in routed)
         return original_experts(module, hidden_states, top_k_index, top_k_weights)
 
     def completed_sweep(module, hook_args, output):
         now = time.perf_counter()
+        previous = state["previous_expert_routes"]
+        reused = len(state["expert_routes"] & previous) if previous is not None else None
         state["passes"] += 1
         pass_records.append(
             {
                 "run": state["run"],
                 "pass": state["passes"],
                 "distinct_expert_loads": state["expert_loads"],
+                "expert_routes_reused": reused,
+                "expert_route_reuse_fraction": (
+                    round(reused / len(state["expert_routes"]), 3) if reused is not None else None
+                ),
                 "seconds_since_previous_sweep": round(now - state["sweep_started"], 3),
             }
         )
         state["expert_loads"] = 0
+        state["previous_expert_routes"] = state["expert_routes"]
+        state["expert_routes"] = set()
         state["sweep_started"] = now
 
     model._run_streamed_experts = MethodType(counted_experts, model)
@@ -85,7 +104,14 @@ def main():
     runs = []
     reference = None
     for run in range(1, args.runs + 1):
-        state.update(run=run, passes=0, expert_loads=0, sweep_started=time.perf_counter())
+        state.update(
+            run=run,
+            passes=0,
+            expert_loads=0,
+            expert_routes=set(),
+            previous_expert_routes=None,
+            sweep_started=time.perf_counter(),
+        )
         torch.cuda.reset_peak_memory_stats(device)
         started = time.perf_counter()
         with torch.no_grad():
@@ -125,6 +151,7 @@ def main():
         "prompt": args.prompt,
         "encoded_prompt_tokens": int(prompt_ids.shape[-1]),
         "max_new_tokens": args.max_new_tokens,
+        "prefetching": args.prefetching,
         "free_before_gib": round(free_before / 2**30, 3),
         "allocator_cap_gib": round(total * ALLOCATOR_FRACTION / 2**30, 3),
         "peak_rss_gib": round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 2**20, 3),
