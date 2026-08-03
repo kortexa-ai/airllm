@@ -282,38 +282,13 @@ class AirLLMDeepseekV4(AirLLMBaseModel):
         for loaded_pos, expert_idx in enumerate(loaded):
             tensors = layer_cache.get(expert_idx)
             if tensors is None:
-                parts = self._expert_keys[layer_idx][expert_idx]
-                w1_weight = raw[parts['w1']['weight']]
-                if w1_weight.element_size() == 1 and all(
-                    'scale' in parts[projection] for projection in ('w1', 'w2', 'w3')
-                ):
-                    # V4 stores gate/up separately, while its runtime expert layout naturally
-                    # fuses them. Concatenating once cuts each expert from three Triton launches
-                    # to two without increasing retained cache bytes.
-                    tensors = {
-                        'gate_up': {
-                            'weight': torch.cat((
-                                w1_weight,
-                                raw[parts['w3']['weight']],
-                            )).to(hidden_states.device),
-                            'scale': torch.cat((
-                                raw[parts['w1']['scale']],
-                                raw[parts['w3']['scale']],
-                            )).to(hidden_states.device),
-                        },
-                        'w2': {
-                            kind: raw[key].to(hidden_states.device)
-                            for kind, key in parts['w2'].items()
-                        },
+                tensors = {
+                    projection: {
+                        kind: raw[key].to(hidden_states.device)
+                        for kind, key in parts.items()
                     }
-                else:
-                    tensors = {
-                        projection: {
-                            kind: raw[key].to(hidden_states.device)
-                            for kind, key in projection_parts.items()
-                        }
-                        for projection, projection_parts in parts.items()
-                    }
+                    for projection, parts in self._expert_keys[layer_idx][expert_idx].items()
+                }
                 if self.expert_cache_size:
                     layer_cache[expert_idx] = tensors
             else:
@@ -324,11 +299,8 @@ class AirLLMDeepseekV4(AirLLMBaseModel):
             else:
                 token_idx, top_k_pos = torch.where(top_k_index == expert_idx)
                 selected = hidden_states[token_idx]
-            if 'gate_up' in tensors:
-                gate, up = self._expert_linear(selected, tensors, 'gate_up').chunk(2, dim=-1)
-            else:
-                gate = self._expert_linear(selected, tensors, 'w1')
-                up = self._expert_linear(selected, tensors, 'w3')
+            gate = self._expert_linear(selected, tensors, 'w1')
+            up = self._expert_linear(selected, tensors, 'w3')
             if module.limit is not None:
                 gate = gate.clamp(max=module.limit)
                 up = up.clamp(min=-module.limit, max=module.limit)
