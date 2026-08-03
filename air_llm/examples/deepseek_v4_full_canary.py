@@ -27,6 +27,10 @@ MAX_NEW_TOKENS = 4
 def main():
     parser = ArgumentParser()
     parser.add_argument("model_path", type=Path)
+    parser.add_argument("--prompt", default=PROMPT)
+    parser.add_argument("--max-new-tokens", type=int, default=MAX_NEW_TOKENS)
+    parser.add_argument("--runs", type=int, default=2)
+    parser.add_argument("--expect-prefix", default="Paris")
     args = parser.parse_args()
 
     device = torch.device("cuda:0")
@@ -49,11 +53,11 @@ def main():
         max_seq_len=64,
         prefetching=False,
     )
-    prompt = encode_messages([{"role": "user", "content": PROMPT}], thinking_mode="chat")
+    prompt = encode_messages([{"role": "user", "content": args.prompt}], thinking_mode="chat")
     prompt_ids = model.tokenizer.encode(prompt, return_tensors="pt").to(device)
     attention_mask = torch.ones_like(prompt_ids)
 
-    state = {"run": 0, "passes": 0, "expert_loads": 0}
+    state = {"run": 0, "passes": 0, "expert_loads": 0, "sweep_started": None}
     pass_records = []
     original_experts = model._run_streamed_experts
 
@@ -62,30 +66,33 @@ def main():
         return original_experts(module, hidden_states, top_k_index, top_k_weights)
 
     def completed_sweep(module, hook_args, output):
+        now = time.perf_counter()
         state["passes"] += 1
         pass_records.append(
             {
                 "run": state["run"],
                 "pass": state["passes"],
                 "distinct_expert_loads": state["expert_loads"],
+                "seconds_since_previous_sweep": round(now - state["sweep_started"], 3),
             }
         )
         state["expert_loads"] = 0
+        state["sweep_started"] = now
 
     model._run_streamed_experts = MethodType(counted_experts, model)
     model.model.model.layers[-1].register_forward_hook(completed_sweep)
 
     runs = []
     reference = None
-    for run in (1, 2):
-        state.update(run=run, passes=0, expert_loads=0)
+    for run in range(1, args.runs + 1):
+        state.update(run=run, passes=0, expert_loads=0, sweep_started=time.perf_counter())
         torch.cuda.reset_peak_memory_stats(device)
         started = time.perf_counter()
         with torch.no_grad():
             generated = model.generate(
                 input_ids=prompt_ids,
                 attention_mask=attention_mask,
-                max_new_tokens=MAX_NEW_TOKENS,
+                max_new_tokens=args.max_new_tokens,
                 do_sample=False,
                 use_cache=True,
                 eos_token_id=model.tokenizer.eos_token_id,
@@ -115,9 +122,9 @@ def main():
 
     result = {
         "status": "pass",
-        "prompt": PROMPT,
+        "prompt": args.prompt,
         "encoded_prompt_tokens": int(prompt_ids.shape[-1]),
-        "max_new_tokens": MAX_NEW_TOKENS,
+        "max_new_tokens": args.max_new_tokens,
         "free_before_gib": round(free_before / 2**30, 3),
         "allocator_cap_gib": round(total * ALLOCATOR_FRACTION / 2**30, 3),
         "peak_rss_gib": round(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 2**20, 3),
@@ -128,7 +135,7 @@ def main():
 
     if not all(run["identical_to_first"] for run in runs):
         raise SystemExit("FAIL: greedy generation changed across runs")
-    if not runs[-1]["completion"].startswith("Paris"):
+    if args.expect_prefix and not runs[-1]["completion"].startswith(args.expect_prefix):
         raise SystemExit(f"FAIL: unexpected completion {runs[-1]['completion']!r}")
 
 

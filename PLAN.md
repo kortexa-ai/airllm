@@ -43,9 +43,21 @@ routed experts selected by each V4 MoE layer.
 
 No pull request or claim of V4 support until gate 4 passes.
 
+## Performance pass
+
+Baseline sustained decode is 5.76 seconds/token with 258 expert loads per token and about
+1.8 GiB of total incremental VRAM use. Optimize and measure in this order:
+
+1. Attribute warm-layer time to expert file reads, host-to-device copies, kernels, and cleanup.
+2. Remove unnecessary per-layer garbage collection and CUDA allocator purges while preserving
+   a bounded, stable memory footprint.
+3. Read all routed experts for a layer through one safetensors open rather than one open per
+   expert.
+4. Measure expert reuse before adding a bounded resident cache or broader prefetching.
+
 ## Deferred
 
 - DSpark speculative decoding.
 - Long-context validation.
-- Expert caching, prefetch scheduling, and production serving.
+- Production serving.
 - CPU expert execution.
