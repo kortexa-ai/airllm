@@ -131,6 +131,7 @@ def test_tiny_native_checkpoint_matches_transformers_and_loads_only_routed_exper
         loaded = model.model.model.layers[0].mlp.experts._airllm_last_experts
         assert len(loaded) == config.num_experts_per_tok
         assert len(loaded) < config.n_routed_experts
+        assert model.model.config._experts_implementation == 'eager'
 
         split = root / 'splitted_model'
         assert (split / 'hc_head.safetensors').is_file()

@@ -174,6 +174,11 @@ class AirLLMDeepseekV4(AirLLMBaseModel):
 
         if hooked:
             self._expert_streaming = True
+            # GenerationMixin otherwise sees Transformers' default ``grouped_mm`` setting and
+            # temporarily swaps the model to ``batched_mm`` during decode. V4's expert forward is
+            # replaced above and owns its FP4 dispatch, so that swap is both irrelevant and fails
+            # when Transformers tries to restore grouped_mm after generation.
+            self.model.config._experts_implementation_internal = 'eager'
             print(f"DeepSeek V4 selective expert streaming enabled: {hooked} experts across "
                   f"{len(self._expert_keys)} layers; only routed experts are read from disk.")
 
