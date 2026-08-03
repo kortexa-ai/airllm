@@ -21,6 +21,7 @@ if 'airllm' not in sys.modules:
     package.__path__ = [str(_AIRLLM_DIR)]
     sys.modules['airllm'] = package
 
+from airllm import airllm_deepseek_v4 as deepseek_v4_module
 from airllm.airllm_deepseek_v4 import AirLLMDeepseekV4
 from airllm.persist import model_persister as persister_module
 from airllm.persist.safetensor_model_persister import SafetensorModelPersister
@@ -103,7 +104,7 @@ def test_packed_fp4_expert_goes_to_native_kernel_without_cpu_dequantization(monk
     assert calls == [(torch.int8, torch.uint8, None)]
 
 
-def test_tiny_native_checkpoint_matches_transformers_and_loads_only_routed_experts():
+def test_tiny_native_checkpoint_matches_transformers_and_batches_routed_expert_read(monkeypatch):
     torch.manual_seed(7)
     config = _tiny_config()
     reference = DeepseekV4ForCausalLM(config).eval()
@@ -124,6 +125,15 @@ def test_tiny_native_checkpoint_matches_transformers_and_loads_only_routed_exper
 
         model = _TokenizerlessV4(
             root, device='cpu', dtype=torch.float32, prefetching=False)
+        expert_reads = []
+        original_load_subset = deepseek_v4_module.load_layer_subset
+
+        def counted_load_subset(local_path, layer_name, keys):
+            if any('.experts.' in key for key in keys):
+                expert_reads.append(tuple(keys))
+            return original_load_subset(local_path, layer_name, keys)
+
+        monkeypatch.setattr(deepseek_v4_module, 'load_layer_subset', counted_load_subset)
         with torch.no_grad():
             actual = model.model(input_ids, use_cache=False).logits
 
@@ -131,6 +141,7 @@ def test_tiny_native_checkpoint_matches_transformers_and_loads_only_routed_exper
         loaded = model.model.model.layers[0].mlp.experts._airllm_last_experts
         assert len(loaded) == config.num_experts_per_tok
         assert len(loaded) < config.n_routed_experts
+        assert len(expert_reads) == 1
         assert model.model.config._experts_implementation == 'eager'
 
         split = root / 'splitted_model'

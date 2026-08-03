@@ -25,6 +25,9 @@ class AirLLMDeepseekV4(AirLLMBaseModel):
 
     _EXPERT_KEY = re.compile(
         r"^layers\.(\d+)\.ffn\.experts\.(\d+)\.(w[123])\.(weight|scale)$")
+    # V4 releases each streamed layer before advancing. Keeping the allocator's blocks cached
+    # avoids 43 full GC / CUDA cache purges per generated token without retaining live weights.
+    clean_memory_after_layer = False
 
     def set_layer_names_dict(self):
         self.layer_names_dict = {
@@ -212,17 +215,23 @@ class AirLLMDeepseekV4(AirLLMBaseModel):
         final = torch.zeros_like(hidden_states)
         with torch.no_grad():
             hit = torch.unique(top_k_index).tolist()
-        loaded = []
+        loaded = [int(expert_idx) for expert_idx in hit
+                  if int(expert_idx) in self._expert_keys[layer_idx]]
 
-        for expert_idx in hit:
-            expert_idx = int(expert_idx)
-            if expert_idx not in self._expert_keys[layer_idx]:
-                continue
+        # Opening a V4 layer shard requires parsing its very large tensor index. Fetch every
+        # routed expert through one handle, then execute them individually to keep the simple
+        # batch-1 kernel path and bounded memory use.
+        keys = [
+            key
+            for expert_idx in loaded
+            for projection in self._expert_keys[layer_idx][expert_idx].values()
+            for key in projection.values()
+        ]
+        raw = load_layer_subset(
+            self.checkpoint_path, self._checkpoint_layer_name(self.layer_names[layer_idx]), keys)
+
+        for expert_idx in loaded:
             token_idx, top_k_pos = torch.where(top_k_index == expert_idx)
-            keys = [key for projection in self._expert_keys[layer_idx][expert_idx].values()
-                    for key in projection.values()]
-            raw = load_layer_subset(
-                self.checkpoint_path, self._checkpoint_layer_name(self.layer_names[layer_idx]), keys)
             tensors = {
                 projection: {kind: raw[key] for kind, key in parts.items()}
                 for projection, parts in self._expert_keys[layer_idx][expert_idx].items()
@@ -237,8 +246,7 @@ class AirLLMDeepseekV4(AirLLMBaseModel):
             current = self._expert_linear(module.act_fn(gate) * up, tensors, 'w2')
             current = current * top_k_weights[token_idx, top_k_pos, None]
             final.index_add_(0, token_idx, current.to(final.dtype))
-            loaded.append(expert_idx)
-            del raw, tensors
+            del tensors
 
         module._airllm_last_experts = loaded
         return final

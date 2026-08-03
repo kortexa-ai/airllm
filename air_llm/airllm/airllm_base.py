@@ -72,6 +72,11 @@ class AirLLMBaseModel:
     # Layers larger than this are loaded into ordinary pageable memory instead.
     max_pinned_layer_bytes = 2 * 1024 ** 3
 
+    # Conservative default for existing adapters. Models with bounded streamed-layer allocations
+    # can opt out so CUDA reuses those blocks instead of synchronizing and returning them to the
+    # driver after every layer.
+    clean_memory_after_layer = True
+
     # Subclasses override this to point at non-standard module names.
     def set_layer_names_dict(self):
         self.layer_names_dict = {'embed': 'model.embed_tokens',
@@ -762,7 +767,8 @@ class AirLLMBaseModel:
                 set_module_tensor_to_device(self.model, param_name, 'meta')
         else:
             module.to('meta')
-        clean_memory()
+        if self.clean_memory_after_layer:
+            clean_memory()
         return output
 
     # ---- delegation to the underlying transformers model ------------------------------------
