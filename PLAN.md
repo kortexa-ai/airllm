@@ -31,8 +31,12 @@ routed experts selected by each V4 MoE layer.
    reservation. The first forward took 65.5 seconds including Triton kernel fetch/compile;
    DeepGEMM currently declines SM120. Reproduce with
    `air_llm/examples/deepseek_v4_one_layer.py` after installing the `deepseek-v4` extra.
-4. **Full-model canary:** one short prompt produces coherent output with a
-   bounded context and token count.
+4. **Full-model canary — passed:** the official chat encoder produced a nine-token
+   `Reply with exactly: Paris` prompt, and a 43-layer greedy run returned `Paris` plus EOS.
+   Cold generation took 47.48 seconds and the identical warm run took 13.27 seconds.
+   Prefill loaded 1,305 distinct routed experts across the layers; one-token decode loaded
+   exactly 258 (six per layer). Peak allocation/reservation was 1,045/1,050 MiB and peak
+   process RSS was 3.12 GiB. Reproduce with `air_llm/examples/deepseek_v4_full_canary.py`.
 
 No pull request or claim of V4 support until gate 4 passes.
 
